@@ -101,9 +101,20 @@ static GHashTable *vips_cache_table = NULL;
  */
 static int vips_cache_time = 0;
 
+/* Estimated memory held by cache entries. Unlike vips_tracked_get_mem(),
+ * this includes image data which libvips does not allocate itself, such as
+ * memory-mapped files and buffers owned by the caller.
+ */
+static size_t vips_cache_mem = 0;
+
 /* Protect cache access with this.
  */
 static GMutex vips_cache_lock;
+
+/* Set while trimming, so allocations made while dropping cache entries can't
+ * recurse back into vips_cache_trim().
+ */
+static GPrivate vips_cache_trim_key = G_PRIVATE_INIT(NULL);
 
 /* A cache entry.
  */
@@ -123,6 +134,10 @@ typedef struct _VipsOperationCacheEntry {
 	/* Set if someone thinks this cache entry should be dropped.
 	 */
 	gboolean invalid;
+
+	/* Estimated memory held by this entry.
+	 */
+	size_t memory;
 
 } VipsOperationCacheEntry;
 
@@ -648,6 +663,12 @@ vips_cache_free(VipsOperationCacheEntry *entry)
 	vips_object_print_summary(VIPS_OBJECT(entry->operation));
 #endif /*DEBUG*/
 
+	g_mutex_lock(&vips_cache_lock);
+	vips_cache_mem = vips_cache_mem >= entry->memory
+		? vips_cache_mem - entry->memory
+		: 0;
+	g_mutex_unlock(&vips_cache_lock);
+
 	if (entry->invalidate_id) {
 		g_signal_handler_disconnect(entry->operation, entry->invalidate_id);
 		entry->invalidate_id = 0;
@@ -768,6 +789,87 @@ vips_object_ref_arg(VipsObject *object,
 	return NULL;
 }
 
+static size_t
+vips_cache_memory_add(size_t memory, guint64 size)
+{
+	if (size > G_MAXSIZE ||
+		memory > G_MAXSIZE - (size_t) size)
+		return G_MAXSIZE;
+
+	return memory + (size_t) size;
+}
+
+static void *
+vips_cache_get_memory_arg(VipsObject *object,
+	GParamSpec *pspec,
+	VipsArgumentClass *argument_class,
+	VipsArgumentInstance *argument_instance,
+	void *a, void *b)
+{
+	size_t *memory = (size_t *) a;
+
+	if ((argument_class->flags & VIPS_ARGUMENT_CONSTRUCT) &&
+		(argument_class->flags & VIPS_ARGUMENT_OUTPUT) &&
+		argument_instance->assigned) {
+		GType type = G_PARAM_SPEC_VALUE_TYPE(pspec);
+
+		if (G_IS_PARAM_SPEC_OBJECT(pspec)) {
+			GObject *value;
+
+			g_object_get(G_OBJECT(object),
+				g_param_spec_get_name(pspec), &value, NULL);
+
+			if (value) {
+				if (VIPS_IS_IMAGE(value))
+					*memory = vips_cache_memory_add(*memory,
+						VIPS_IMAGE_SIZEOF_IMAGE(VIPS_IMAGE(value)));
+
+				g_object_unref(value);
+			}
+		}
+		else if (type == VIPS_TYPE_ARRAY_IMAGE) {
+			GValue value = G_VALUE_INIT;
+			VipsArrayImage *array;
+			VipsImage **images;
+			int n;
+
+			g_value_init(&value, type);
+			g_object_get_property(G_OBJECT(object),
+				g_param_spec_get_name(pspec), &value);
+
+			array = g_value_get_boxed(&value);
+			if (array) {
+				images = vips_array_image_get(array, &n);
+
+				for (int i = 0; i < n; i++)
+					if (VIPS_IS_IMAGE(images[i]))
+						*memory = vips_cache_memory_add(*memory,
+							VIPS_IMAGE_SIZEOF_IMAGE(images[i]));
+			}
+
+			g_value_unset(&value);
+		}
+	}
+
+	return NULL;
+}
+
+/* Estimate the memory held by an operation. We count output images rather
+ * than inputs as well, since inputs are usually shared with other cache
+ * entries and would be counted many times.
+ */
+static size_t
+vips_cache_get_memory(VipsOperation *operation)
+{
+	size_t memory;
+
+	memory = VIPS_OBJECT(operation)->local_memory;
+	(void) vips_argument_map(VIPS_OBJECT(operation),
+		vips_cache_get_memory_arg, &memory, NULL);
+
+	return memory;
+}
+
 static void
 vips_entry_touch(VipsOperationCacheEntry *entry)
 {
@@ -867,9 +969,18 @@ vips_cache_invalidate_cb(VipsOperation *operation, void *user_data)
 }
 
 static void
-vips_cache_insert(VipsOperation *operation)
+vips_cache_insert(VipsOperation *operation, size_t memory)
 {
 	VipsOperationCacheEntry *entry = g_new(VipsOperationCacheEntry, 1);
+
+	/* A single entry larger than the whole cache budget would evict
+	 * everything else and still leave us over the limit.
+	 */
+	if (vips_cache_max_mem == 0 ||
+		memory > vips_cache_max_mem) {
+		g_free(entry);
+		return;
+	}
 
 #ifdef VIPS_DEBUG
 	printf("vips_cache_insert: adding to cache");
@@ -880,8 +991,10 @@ vips_cache_insert(VipsOperation *operation)
 	entry->time = 0;
 	entry->invalidate_id = 0;
 	entry->invalid = FALSE;
+	entry->memory = memory;
 
 	g_hash_table_insert(vips_cache_table, operation, entry);
+	vips_cache_mem = vips_cache_memory_add(vips_cache_mem, memory);
 	vips_entry_ref(entry);
 
 	/* If the operation signals "invalidate", we must tag this cache entry
@@ -957,19 +1070,30 @@ vips_cache_get_lru(void)
 	return NULL;
 }
 
-/* Is the cache full? Drop until it's not.
+/* Drop cache entries until we're under @mem_limit.
+ *
+ * Caller must hold no locks. We have to release vips_cache_lock while freeing
+ * entries since this can run arbitrary dispose code.
  */
 static void
-vips_cache_trim(void)
+vips_cache_trim_to(size_t mem_limit)
 {
 	VipsOperation *operation;
+
+	if (g_private_get(&vips_cache_trim_key))
+		return;
+
+	g_private_set(&vips_cache_trim_key, GINT_TO_POINTER(1));
 
 	g_mutex_lock(&vips_cache_lock);
 
 	while (vips_cache_table &&
 		(g_hash_table_size(vips_cache_table) > vips_cache_max ||
 			vips_tracked_get_files() > vips_cache_max_files ||
-			vips_tracked_get_mem() > vips_cache_max_mem) &&
+			(mem_limit == 0 &&
+				g_hash_table_size(vips_cache_table) > 0) ||
+			vips_cache_mem > mem_limit ||
+			vips_tracked_get_mem() > mem_limit) &&
 		(operation = vips_cache_get_lru())) {
 #ifdef DEBUG
 		printf("vips_cache_trim: trimming ");
@@ -986,6 +1110,37 @@ vips_cache_trim(void)
 	}
 
 	g_mutex_unlock(&vips_cache_lock);
+
+	g_private_set(&vips_cache_trim_key, NULL);
+}
+
+/* Is the cache full? Drop until it's not.
+ */
+static void
+vips_cache_trim(void)
+{
+	vips_cache_trim_to(vips_cache_max_mem);
+}
+
+/* Called after a tracked allocation has been reserved, but before the memory
+ * is actually allocated. The reservation means concurrent allocations are
+ * visible here, so we can make room in the cache before the peak grows.
+ */
+void
+vips__cache_trim(size_t mem)
+{
+	size_t max_mem;
+
+	max_mem = vips_cache_max_mem;
+
+	if (mem <= max_mem)
+		return;
+
+	/* We might still be above the limit with an empty cache: active work
+	 * can use memory that we can't reclaim. In that case trimming is
+	 * harmless, just cheap.
+	 */
+	vips_cache_trim_to(max_mem);
 }
 
 #ifdef DEBUG_LEAK
@@ -1062,6 +1217,7 @@ vips_cache_operation_buildp(VipsOperation **operation)
 
 	VipsOperationCacheEntry *hit;
 	VipsOperationCacheEntry *hit_invalid = NULL;
+	size_t memory = 0;
 
 	g_assert(VIPS_IS_OPERATION(*operation));
 
@@ -1157,6 +1313,14 @@ vips_cache_operation_buildp(VipsOperation **operation)
 		 */
 		flags = vips_operation_get_flags(*operation);
 
+		/* Has to be after _build() so we can see output args. Do this
+		 * before taking the cache lock, since accessing properties can
+		 * allocate.
+		 */
+		memory = (flags & VIPS_OPERATION_NOCACHE)
+			? 0
+			: vips_cache_get_memory(*operation);
+
 		g_mutex_lock(&vips_cache_lock);
 
 		/* If two threads build the same operation at the same time,
@@ -1175,7 +1339,7 @@ vips_cache_operation_buildp(VipsOperation **operation)
 			}
 
 			if (!(flags & VIPS_OPERATION_NOCACHE))
-				vips_cache_insert(*operation);
+				vips_cache_insert(*operation, memory);
 		}
 
 		g_mutex_unlock(&vips_cache_lock);
@@ -1233,12 +1397,16 @@ vips_cache_set_max(int max)
  * vips_cache_set_max_mem:
  * @max_mem: maximum amount of tracked memory we use
  *
- * Set the maximum amount of tracked memory we allow before we start dropping
- * cached operations. See [func@tracked_get_mem].
+ * Set the maximum amount of memory we allow before we start dropping cached
+ * operations. This includes memory tracked by [func@tracked_get_mem], plus an
+ * estimate of the pixels held by cached output images. The estimate can
+ * include memory-mapped files and buffers owned by the caller, which are
+ * invisible to the tracked allocator.
  *
- * libvips only tracks memory it allocates, it can't track memory allocated by
- * external libraries. If you use an operation like [ctor@Image.magickload],
- * most of the memory it uses won't be included.
+ * An operation whose estimated memory is larger than @max_mem is not cached.
+ * libvips can't track memory allocated by external libraries, so operations
+ * like [ctor@Image.magickload] may still use memory which is not included in
+ * the estimate.
  *
  * ::: seealso
  *     [func@tracked_get_mem].
@@ -1289,8 +1457,8 @@ vips_cache_get_size(void)
 /**
  * vips_cache_get_max_mem:
  *
- * Get the maximum amount of tracked memory we allow before we start dropping
- * cached operations. See [func@tracked_get_mem].
+ * Get the maximum amount of memory we allow before we start dropping cached
+ * operations. See [func@cache_set_max_mem].
  *
  * ::: seealso
  *     [func@tracked_get_mem].

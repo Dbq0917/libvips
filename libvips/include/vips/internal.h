@@ -169,6 +169,7 @@ VIPS_API void vips__worker_cond_wait(GCond *cond, GMutex *mutex);
 gboolean vips__worker_exit(void);
 
 void vips__cache_init(void);
+void vips__cache_trim(size_t mem);
 
 int vips__print_renders(void);
 int vips__type_leak(void);

@@ -74,6 +74,7 @@
 #endif
 
 #include <vips/vips.h>
+#include <vips/internal.h>
 
 /* g_assert_not_reached() on memory errors.
 #define DEBUG
@@ -303,6 +304,7 @@ void *
 vips_tracked_malloc(size_t size)
 {
 	void *buf;
+	size_t tracked_mem;
 
 	/* Need an extra sizeof(size_t) bytes to track
 	 * size of this block. Ask for an extra 16 to make sure we don't break
@@ -310,7 +312,21 @@ vips_tracked_malloc(size_t size)
 	 */
 	size += 16;
 
+	/* Reserve the memory before allocating so the cache can make room
+	 * first, and so concurrent allocations are visible to the trim.
+	 */
+	g_mutex_lock(&vips_tracked_mutex);
+	vips_tracked_mem += size;
+	tracked_mem = vips_tracked_mem;
+	g_mutex_unlock(&vips_tracked_mutex);
+
+	vips__cache_trim(tracked_mem);
+
 	if (!(buf = g_try_malloc0(size))) {
+		g_mutex_lock(&vips_tracked_mutex);
+		vips_tracked_mem -= size;
+		g_mutex_unlock(&vips_tracked_mutex);
+
 #ifdef DEBUG
 		g_assert_not_reached();
 #endif /*DEBUG*/
@@ -329,7 +345,6 @@ vips_tracked_malloc(size_t size)
 	*((size_t *) buf) = size;
 	buf = (void *) ((char *) buf + 16);
 
-	vips_tracked_mem += size;
 	if (vips_tracked_mem > vips_tracked_mem_highwater)
 		vips_tracked_mem_highwater = vips_tracked_mem;
 	vips_tracked_allocs += 1;
@@ -368,6 +383,7 @@ void *
 vips_tracked_aligned_alloc(size_t size, size_t align)
 {
 	void *buf;
+	size_t tracked_mem;
 
 	g_assert(!(align & (align - 1)));
 
@@ -375,6 +391,13 @@ vips_tracked_aligned_alloc(size_t size, size_t align)
 	 * size of this block.
 	 */
 	size += sizeof(size_t);
+
+	g_mutex_lock(&vips_tracked_mutex);
+	vips_tracked_mem += size;
+	tracked_mem = vips_tracked_mem;
+	g_mutex_unlock(&vips_tracked_mutex);
+
+	vips__cache_trim(tracked_mem);
 
 #ifdef HAVE__ALIGNED_MALLOC
 	if (!(buf = _aligned_malloc(size, align))) {
@@ -385,6 +408,12 @@ vips_tracked_aligned_alloc(size_t size, size_t align)
 #else
 #error Missing aligned alloc implementation
 #endif
+	{
+		g_mutex_lock(&vips_tracked_mutex);
+		vips_tracked_mem -= size;
+		g_mutex_unlock(&vips_tracked_mutex);
+	}
+
 #ifdef DEBUG
 		g_assert_not_reached();
 #endif /*DEBUG*/
@@ -404,7 +433,6 @@ vips_tracked_aligned_alloc(size_t size, size_t align)
 
 	*((size_t *) buf) = size;
 
-	vips_tracked_mem += size;
 	if (vips_tracked_mem > vips_tracked_mem_highwater)
 		vips_tracked_mem_highwater = vips_tracked_mem;
 	vips_tracked_allocs += 1;
